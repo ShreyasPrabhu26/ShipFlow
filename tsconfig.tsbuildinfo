@@ -1,1 +1,1 @@
-{"root":["./src/index.ts","./src/controllers/upload.ts","./src/routes/upload.ts"],"version":"5.8.3"}
+{"root":["./src/config.ts","./src/index.ts","./src/types.ts","./src/controllers/upload.ts","./src/routes/upload.ts","./src/utils/logger.ts","./src/utils/s3Uploader.ts"],"version":"5.8.3"}
