@@ -323,3 +323,299 @@ export async function downloadS3Folder(id: string): Promise<void> {
         return Promise.reject(error);
     }
 }
+
+/**
+ * Upload statistics for tracking and logging purposes
+ */
+interface UploadStats {
+    totalFiles: number;
+    filesUploaded: number;
+    totalBytes: number;
+    bytesUploaded: number;
+    startTime: number;
+    lastLogTime: number;
+}
+
+/**
+ * Utility class to handle recursive uploads to S3
+ */
+export class S3DirectoryUploader {
+    private s3Client: AWS.S3;
+    private bucket: string;
+    private stats: UploadStats = {
+        totalFiles: 0,
+        filesUploaded: 0,
+        totalBytes: 0,
+        bytesUploaded: 0,
+        startTime: 0,
+        lastLogTime: 0
+    };
+    private logIntervalMs = 2000; // Log progress every 2 seconds
+
+    /**
+     * Creates a new S3DirectoryUploader instance
+     * @param region - AWS region
+     * @param bucket - S3 bucket name
+     */
+    constructor(region: string, bucket: string) {
+        Logger.info(`Initializing S3DirectoryUploader for region ${region}, bucket ${bucket}`);
+
+        // Initialize S3 client with region and optional credentials if available
+        const clientConfig: AWS.S3.ClientConfiguration = { region };
+
+        // Only add credentials if they are explicitly provided
+        if (HAS_EXPLICIT_CREDENTIALS) {
+            Logger.info('Using explicitly provided AWS credentials');
+            clientConfig.credentials = new AWS.Credentials({
+                accessKeyId: AWS_CREDENTIALS.accessKeyId!,
+                secretAccessKey: AWS_CREDENTIALS.secretAccessKey!,
+                sessionToken: AWS_CREDENTIALS.sessionToken
+            });
+        } else {
+            Logger.warn('No explicit credentials found. Using AWS credential provider chain.');
+        }
+
+        this.s3Client = new AWS.S3(clientConfig);
+        this.bucket = bucket;
+    }
+
+    /**
+     * Format bytes to a human-readable string
+     */
+    private formatBytes(bytes: number): string {
+        return Logger.formatBytes(bytes);
+    }
+
+    /**
+     * Log upload progress if enough time has passed since the last log
+     */
+    private logProgress(): void {
+        const now = Date.now();
+
+        // Only log if it's been at least logIntervalMs since last log
+        if (now - this.stats.lastLogTime >= this.logIntervalMs) {
+            const elapsedSeconds = (now - this.stats.startTime) / 1000;
+            const percentComplete = this.stats.totalFiles > 0
+                ? Math.round((this.stats.filesUploaded / this.stats.totalFiles) * 100)
+                : 0;
+
+            const bytesProgress = this.stats.totalBytes > 0
+                ? Math.round((this.stats.bytesUploaded / this.stats.totalBytes) * 100)
+                : 0;
+
+            const uploadRate = elapsedSeconds > 0
+                ? this.stats.bytesUploaded / elapsedSeconds
+                : 0;
+
+            Logger.info(
+                `Upload progress: ${this.stats.filesUploaded}/${this.stats.totalFiles} files ` +
+                `(${percentComplete}%) | ${this.formatBytes(this.stats.bytesUploaded)}/${this.formatBytes(this.stats.totalBytes)} ` +
+                `(${bytesProgress}%) | ${this.formatBytes(uploadRate)}/s`
+            );
+
+            this.stats.lastLogTime = now;
+        }
+    }
+
+    /**
+     * Uploads a file to S3
+     * @param localFilePath - Path to local file
+     * @param s3Key - The S3 key where the file will be uploaded
+     */
+    private async uploadFile(localFilePath: string, s3Key: string): Promise<void> {
+        try {
+            // Get file stats for size
+            const fileStats = fs.statSync(localFilePath);
+            const fileSize = fileStats.size;
+
+            Logger.info(`Uploading file ${localFilePath} (${this.formatBytes(fileSize)}) to S3:${s3Key}`);
+            const startTime = Date.now();
+
+            // Create read stream for the file
+            const fileContent = fs.createReadStream(localFilePath);
+            
+            const uploadParams = {
+                Bucket: this.bucket,
+                Key: s3Key,
+                Body: fileContent,
+                ContentType: this.getContentType(localFilePath)
+            };
+
+            await this.s3Client.upload(uploadParams).promise();
+
+            // Update statistics
+            this.stats.filesUploaded++;
+            this.stats.bytesUploaded += fileSize;
+            
+            const duration = Date.now() - startTime;
+            Logger.info(`Successfully uploaded ${localFilePath} to S3:${s3Key} (${this.formatBytes(fileSize)}) in ${duration}ms`);
+            
+            // Log progress periodically
+            this.logProgress();
+        } catch (error) {
+            Logger.error(`Error uploading ${localFilePath} to S3:${s3Key}:`, error);
+            throw error;
+        }
+    }
+
+    /**
+     * Gets the content type for a file based on its extension
+     * @param filePath - Path to the file
+     */
+    private getContentType(filePath: string): string {
+        const ext = path.extname(filePath).toLowerCase();
+        switch (ext) {
+            case '.html': return 'text/html';
+            case '.css': return 'text/css';
+            case '.js': return 'application/javascript';
+            case '.json': return 'application/json';
+            case '.png': return 'image/png';
+            case '.jpg': case '.jpeg': return 'image/jpeg';
+            case '.gif': return 'image/gif';
+            case '.svg': return 'image/svg+xml';
+            case '.ico': return 'image/x-icon';
+            case '.txt': return 'text/plain';
+            case '.pdf': return 'application/pdf';
+            default: return 'application/octet-stream';
+        }
+    }
+
+    /**
+     * Calculate statistics for all files in the directory to be uploaded
+     * @param localDir - Local directory to calculate stats for
+     */
+    private async calculateLocalStats(localDir: string): Promise<void> {
+        try {
+            const calculateForDir = (dir: string) => {
+                const entries = fs.readdirSync(dir, { withFileTypes: true });
+                
+                for (const entry of entries) {
+                    const fullPath = path.join(dir, entry.name);
+                    
+                    if (entry.isDirectory()) {
+                        calculateForDir(fullPath); // Recurse into subdirectories
+                    } else {
+                        const stats = fs.statSync(fullPath);
+                        this.stats.totalFiles++;
+                        this.stats.totalBytes += stats.size;
+                    }
+                }
+            };
+            
+            calculateForDir(localDir);
+            
+            Logger.info(`Found ${this.stats.totalFiles} files (${this.formatBytes(this.stats.totalBytes)}) to upload`);
+        } catch (error) {
+            Logger.error(`Error calculating stats for ${localDir}:`, error);
+            throw error;
+        }
+    }
+
+    /**
+     * Upload a directory to S3
+     * @param localDir - Local directory to upload
+     * @param s3Prefix - The S3 key prefix to upload to
+     */
+    public async uploadDirectory(localDir: string, s3Prefix: string): Promise<void> {
+        try {
+            Logger.info(`Starting upload from ${localDir} to S3:${s3Prefix}`);
+
+            // Reset stats and start timer
+            this.stats = {
+                totalFiles: 0,
+                filesUploaded: 0,
+                totalBytes: 0,
+                bytesUploaded: 0,
+                startTime: Date.now(),
+                lastLogTime: Date.now()
+            };
+            
+            // Calculate stats first
+            await this.calculateLocalStats(localDir);
+            
+            // Upload files with concurrency limit
+            const uploadQueue: Promise<void>[] = [];
+            const concurrencyLimit = 5;
+            
+            const processDirectory = async (dir: string, relativePath: string) => {
+                const entries = fs.readdirSync(dir, { withFileTypes: true });
+                
+                for (const entry of entries) {
+                    const entryRelPath = path.join(relativePath, entry.name);
+                    const fullPath = path.join(dir, entry.name);
+                    
+                    if (entry.isDirectory()) {
+                        await processDirectory(fullPath, entryRelPath);
+                    } else {
+                        const s3Key = path.posix.join(s3Prefix, entryRelPath).replace(/\\/g, '/'); // Normalize for S3 paths
+                        
+                        // Manage concurrency
+                        if (uploadQueue.length >= concurrencyLimit) {
+                            await Promise.race(uploadQueue.map(p => p.catch(() => {})));
+                            // Remove completed promises
+                            const completedIndex = await Promise.race(
+                                uploadQueue.map((p, i) => p.then(() => i).catch(() => -1))
+                            );
+                            if (completedIndex !== -1) {
+                                uploadQueue.splice(completedIndex, 1);
+                            }
+                        }
+                        
+                        const uploadPromise = this.uploadFile(fullPath, s3Key).catch(err => {
+                            Logger.error(`Failed to upload ${fullPath}:`, err);
+                            throw err;
+                        });
+                        
+                        uploadQueue.push(uploadPromise);
+                    }
+                }
+            };
+            
+            await processDirectory(localDir, '');
+            
+            // Wait for all remaining uploads to complete
+            if (uploadQueue.length > 0) {
+                await Promise.all(uploadQueue);
+            }
+            
+            const totalTimeSeconds = (Date.now() - this.stats.startTime) / 1000;
+            
+            Logger.info(
+                `Upload completed: ${this.stats.filesUploaded} files (${this.formatBytes(this.stats.bytesUploaded)}) ` +
+                `uploaded in ${totalTimeSeconds.toFixed(1)}s`
+            );
+        } catch (error) {
+            Logger.error(`Error uploading directory ${localDir} to S3:${s3Prefix}:`, error);
+            throw error;
+        }
+    }
+}
+
+/**
+ * Uploads the dist folder from a built React project to S3
+ * @param id - The project id
+ * @param deploymentId - Optional deployment ID for S3 prefix
+ * @returns Promise that resolves when upload is complete
+ */
+export async function uploadDistFolder(id: string, deploymentId?: string): Promise<void> {
+    const projectDir = `output/${id}`;
+    const distDir = path.join(projectDir, 'dist');
+    const s3Prefix = deploymentId ? `deployments/${id}/${deploymentId}` : `deployments/${id}`;
+    
+    Logger.info(`Uploading dist folder from ${distDir} to S3 prefix: ${s3Prefix}`);
+    
+    try {
+        // Check if dist directory exists
+        if (!fs.existsSync(distDir)) {
+            throw new Error(`Dist directory not found: ${distDir}`);
+        }
+        
+        const uploader = new S3DirectoryUploader(AWS_REGION, S3_BUCKET);
+        await uploader.uploadDirectory(distDir, s3Prefix);
+        Logger.info(`Successfully uploaded dist folder from ${distDir} to S3 prefix: ${s3Prefix}`);
+        return Promise.resolve();
+    } catch (error) {
+        Logger.error(`Failed to upload dist folder for project ${id}:`, error);
+        return Promise.reject(error);
+    }
+}
