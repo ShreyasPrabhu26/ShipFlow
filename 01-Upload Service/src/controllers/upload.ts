@@ -68,6 +68,7 @@ export async function uploadController(req: Request & { body: UploadRequestBody 
     Logger.info(`Upload process completed successfully in ${totalDuration}ms`);
 
     publisher.lPush("build-queue", id);
+    publisher.hSet("status", id, "uploaded")
 
     const response: UploadResponse = {
       id,
