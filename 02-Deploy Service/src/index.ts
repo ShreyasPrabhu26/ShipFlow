@@ -9,12 +9,15 @@ import { exec } from 'child_process';
 const subscriber = createClient();
 subscriber.connect();
 
+const publisher = createClient();
+publisher.connect()
+
 dotenv.config();
 
 async function main() {
     Logger.info('Deploy service started');
     Logger.info('Waiting for build queue messages...');
-    
+
     while (1) {
         try {
             const res = await subscriber.brPop(
@@ -22,7 +25,7 @@ async function main() {
                 'build-queue',
                 0
             );
-            
+
             if (res && res.element) {
                 Logger.info(`Received message from build queue: ${res.element}`);
                 await downloadS3Folder(res.element);
@@ -42,34 +45,35 @@ export async function buildProject(id: string) {
         // Use absolute path for better reliability
         const projectRoot = path.resolve(process.cwd());
         const outputDir = path.join(projectRoot, `output/${id}`);
-        
+
         Logger.info(`Building project ${id}... in directory ${outputDir}`);
-        
+
         // Check if directory exists before building
         if (!fs.existsSync(outputDir)) {
             const errorMsg = `Project directory not found: ${outputDir}`;
             Logger.error(errorMsg);
             return reject(new Error(errorMsg));
         }
-        
+
         // Run npm commands with more verbose output
         const buildCmd = `cd "${outputDir}" && npm install && npm run build`;
         Logger.info(`Executing command: ${buildCmd}`);
-        
+
         const child = exec(buildCmd);
-        
-        child.stdout?.on('data', function(data) {
+
+        child.stdout?.on('data', function (data) {
             Logger.info(`[BUILD][stdout] ${data.trim()}`);
         });
-        
-        child.stderr?.on('data', function(data) {
+
+        child.stderr?.on('data', function (data) {
             Logger.error(`[BUILD][stderr] ${data.trim()}`);
         });
-        
-        child.on('close', async function(code) {
+
+        child.on('close', async function (code) {
             if (code === 0) {
                 Logger.info(`Build successful for project ${id}`);
-                
+                publisher.hSet("status", id, "Deployed")
+
                 // Verify the dist folder was created
                 const distDir = path.join(outputDir, 'dist');
                 if (!fs.existsSync(distDir)) {
@@ -77,13 +81,13 @@ export async function buildProject(id: string) {
                     Logger.error(errorMsg);
                     return reject(new Error(errorMsg));
                 }
-                
+
                 Logger.info(`Dist folder found at ${distDir}`);
-                
+
                 try {
                     // Generate a timestamp-based deployment ID
                     const deploymentId = new Date().toISOString().replace(/[:.]/g, '-');
-                    
+
                     // Upload the dist folder to S3
                     await uploadDistFolder(id, deploymentId);
                     Logger.info(`Deployment ${deploymentId} completed for project ${id}`);
